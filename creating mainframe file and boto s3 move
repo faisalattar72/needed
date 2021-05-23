@@ -1,0 +1,398 @@
+import json
+import datetime as dt
+from configparser import ConfigParser
+import boto3
+import pyspark
+from pyspark.sql import SparkSession
+from pyspark.context import SparkContext
+from pyspark.sql.types import StructField, StructType , StringType
+from pyspark.sql.functions import *
+from pyspark import StorageLevel
+import time
+from collections import OrderedDict
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+args = getResolvedOptions(sys.argv, ['JOB_NAME','env'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+
+
+sc._jsc.hadoopConfiguration().set("mapred.output.committer.class", "org.apache.hadoop.mapred.FileOutputCommitter")
+
+spark = SparkSession \
+    .builder \
+    .appName("Python Spark SQL basic example").master('local') \
+    .config("spark.dynamicAllocation.executorIdleTimeout", "600") \
+    .getOrCreate()
+
+config = ConfigParser()
+file = 'glue_config.ini'
+deploy_env = args['env']
+print(deploy_env)
+config.read(file)
+client_number_var = (config[deploy_env]['client_number'])
+e99_codes_var = (config[deploy_env]['code'])
+e99_codes="tenant_restriction_code in "+ e99_codes_var
+glue_catalog_db = (config[deploy_env]['glue_catalog_database'])
+outbound_bucket = (config[deploy_env]['outbound_bucket'])
+output_file_name = (config[deploy_env]['output_file_name'])
+
+def get_header_for_naye():
+    formatString = ''
+    values = []
+
+    ############### SP: 1, DESCRIPTION: FILLER
+    formatString += '{:56.56}'
+    try:
+        values.append(' '*56)
+    except:
+        values.append(' '*56)
+        
+    ############### SP: 57, DESCRIPTION: CONSTANT
+    formatString += '{:5.5}'
+    try:
+        values.append('DATE=')
+    except:
+        values.append(' '*5)
+
+    ############### SP: 62, DESCRIPTION: PROCESS DATE (YYMMDD)
+    formatString += '{:8.8}'
+    try:
+        values.append(dt.date.today().strftime("%Y%m%d"))
+    except:
+        values.append(' '*8)    
+
+    ############### SP: 71, DESCRIPTION: FILLER
+    formatString += '{:1130.1130}'
+    try:
+        values.append(' '*1130)
+    except:
+        values.append(' '*1130)
+
+    return formatString.format(*values)
+
+
+def get_trailer_for_naye(count):
+    formatString = ''
+    values = []
+
+    ############### SP: 1, DESCRIPTION: FILLER
+    formatString += '{:56.56}'
+    try:
+        values.append(' '*56)
+    except:
+        values.append(' '*56)
+
+    ############### SP: 57, DESCRIPTION: CONSTANT
+    formatString += '{:10.10}'
+    try:
+        values.append('REC COUNT=')
+    except:
+        values.append(' '*10)
+
+    ############### SP: 67, DESCRIPTION: RECORD COUNT
+    formatString += '{:8.8}'
+    try:
+        values.append(count.zfill(8))
+    except:
+        values.append(' '*8)    
+
+    ############### SP: 75, DESCRIPTION: FILLER
+    formatString += '{:1126.1126}'
+    try:
+        values.append(' '*1126)
+    except:
+        values.append(' '*1126)
+
+    return formatString.format(*values)
+
+
+def transform(row):
+    accounts = row
+    formatString = ''
+    values = []
+
+    ##  Segment:6000A00, FieldName:CLIENT_NUMBER, SP: 1, isDerived:
+    formatString += '{:4.4}'
+    try:
+        values.append(accounts['client_number'] if accounts['client_number'] is not None else ' '*4)
+    except:
+        values.append(' '*4 )
+
+    ##  Segment:6000A00, FieldName:BRANCH_ACCOUNT_branch, SP: 5, isDerived:
+    formatString += '{:3.3}'
+    try:
+        values.append(str(accounts['branch_code']) if accounts['branch_code'] is not None else ' '*3 )
+    except:
+        values.append(' '*3 )
+
+    ##  Segment:6000A00, FieldName:BRANCH_ACCOUNT-, SP: 8, isDerived:
+    formatString += '{:1.1}'
+    try:
+        values.append('-')
+    except:
+        values.append(' '*1)
+
+    ##  Segment:6000A00, FieldName: BRANCH_ACCOUNT_account_number, SP: 9, isDerived:
+    formatString += '{:5.5}'
+    try:
+        values.append(str(accounts['account_number']) if accounts['account_number'] is not None else ' '*5)
+    except:
+        values.append(' '*5 )
+
+    ##  Segment:6000A00, FieldName:BRANCH_ACCOUNT-, SP: 14, isDerived:
+    formatString += '{:1.1}'
+    try:
+        values.append(' '*1)
+    except:
+        values.append(' '*1)
+
+    ##  Segment:6000A00, FieldName:spad_security_code, SP: 15, isDerived:
+    formatString += '{:4.4}'
+    try:
+        values.append(accounts['spad_security_code'] if accounts['spad_security_code'] is not None else ' '*4)
+    except:
+        values.append(' '*4 )
+
+    ##  Segment:6000A00, FieldName:app_type_code, SP: 19, isDerived:
+    formatString += '{:4.4}'
+    try:
+        values.append(accounts['app_type_code'] if accounts['app_type_code'] is not None else ' '*4)
+    except:
+        values.append(' '*4 )
+
+    ##  Segment:6000A00, FieldName: expiry_datetype, SP: 23, isDerived:
+    formatString += '{:10.10}'
+    try:
+        values.append(accounts['expiry_datetype'] if accounts['expiry_datetype'] is not None else ' '*10)
+    except:
+        values.append(' '*10 )
+
+    ##  Segment:6000A00, FieldName: msg_line_number, SP: 33, isDerived:
+    formatString += '{:4.4}'
+    try:
+        values.append(accounts['msg_line_number'] if accounts['msg_line_number'] is not None else ' '*4)
+    except:
+        values.append(' '*4 )
+
+    ##  Segment:6000A00, FieldName:  space_fillers, SP: 37, isDerived:
+    formatString += '{:20.20}'
+    try:
+        values.append(' '*20)
+    except:
+        values.append(' '*20)
+        
+    ##  Segment:6000A00, FieldName: operation_code, SP: 57, isDerived:
+    formatString += '{:1.1}'
+    try:
+        values.append(accounts['operation_code'] if accounts['operation_code'] is not None else ' '*1 )
+    except:
+        values.append(' '*1 )
+
+    ##  Segment:6000A00, FieldName: branch_code, SP: 58, isDerived:
+    formatString += '{:3.3}'
+    try:
+        values.append(str(accounts['branch_code']) if accounts['branch_code'] is not None else ' '*3)
+    except:
+        values.append(' '*3 )
+
+    ##  Segment:6000A00, FieldName:BRANCH_ACCOUNT-, SP: 61, isDerived:
+    formatString += '{:1.1}'
+    try:
+        values.append('-'*1)
+    except:
+        values.append(' '*1)
+
+    ##  Segment:6000A00, FieldName: account_number, SP: 62, isDerived:
+    formatString += '{:5.5}'
+    try:
+        values.append(str(accounts['account_number']) if accounts['account_number'] is not None else ' '*5)
+    except:
+        values.append(' '*5 )
+
+    ##  Segment:6000A00, FieldName: creation_date, SP: 67, isDerived:
+    formatString += '{:10.10}'
+    try:
+        values.append(str(accounts['creation_date']) if accounts['creation_date'] is not None else ' '*10)
+    except:
+        values.append(' '*10 )
+
+    ##  Segment:6000A00, FieldName: user_msg_org_code, SP: 77, isDerived:
+    formatString += '{:4.4}'
+    try:
+        values.append(accounts['user_msg_org_code'] if accounts['user_msg_org_code'] is not None else ' '*4)
+    except:
+        values.append(' '*4 )
+
+    ##  Segment:6000A00, FieldName: user_security_org_code, SP: 81, isDerived:
+    formatString += '{:4.4}'
+    try:
+        values.append(accounts['user_security_org_code']  if accounts['user_security_org_code'] is not None else ' '*4)
+    except:
+        values.append(' '*4 )
+
+    ##  Segment:6000A00, FieldName:  updated_datetime_stamp, SP: 85, isDerived:
+    formatString += '{:23.23}'
+    try:
+        values.append(accounts['updated_timestamp'] if accounts['updated_timestamp'] is not None else ' '*23)
+    except:
+        values.append(' '*23 )
+
+    ##  Segment:6000A00, FieldName:  timestamp_filler, SP: 108, isDerived:
+    formatString += '{:3.3}'
+    try:
+        values.append(' '*3)
+    except:
+        values.append(' '*3)
+
+    ##  Segment:6000A00, FieldName:  space_filler, SP: 111, isDerived:
+    formatString += '{:63.63}'
+    try:
+        values.append(' '*63)
+    except:
+        values.append(' '*63)
+
+     ##  Segment:6000A00, FieldName: *space_filler, SP: 174, isDerived:     #new
+    formatString += '{:4.4}'
+    try:
+        values.append(((str(len(accounts['restriction_name']))).ljust(4,' ')) if accounts['restriction_name'] is not None else ' '*4 )
+    except:
+        values.append(' '*4)
+
+    ##  Segment:6000A00, FieldName:  Text_msg, SP: 178, isDerived:      #75->1006
+    formatString += '{:1023.1023}'
+    try:
+        values.append(((accounts['restriction_name']).ljust(1023,' ')) if accounts['restriction_name'] is not None else ' '*1023 )
+    except:
+        values.append(' '*1023 )
+
+    
+    return formatString.format(*values)
+
+
+
+
+
+
+
+
+modified_res_master_0 = glueContext.create_dynamic_frame.from_catalog(database = glue_catalog_db, table_name = "ramsdb_public_restriction_master", transformation_ctx = "modified_res_master_0")
+modified_res_master_1 = modified_res_master_0.toDF()
+
+modified_case_master_0 = glueContext.create_dynamic_frame.from_catalog(database = glue_catalog_db, table_name = "ramsdb_public_case_master", transformation_ctx = "modified_case_master_0")
+modified_case_master_1 = modified_case_master_0.toDF()
+modified_case_master_2 = modified_case_master_1.select("case_idr","operation_code")
+
+modified_accounts_restrictions_0 = glueContext.create_dynamic_frame.from_catalog(database = glue_catalog_db, table_name = "ramsdb_public_accounts_restrictions", transformation_ctx = "modified_accounts_restrictions_0")
+modified_accounts_restrictions_1 = modified_accounts_restrictions_0.toDF()
+modified_accounts_restrictions_2 = modified_accounts_restrictions_1.select("case_idr","restriction_tenant_code")
+
+modified_restriction_metabase_0 = glueContext.create_dynamic_frame.from_catalog(database = glue_catalog_db, table_name = "ramsdb_public_restriction_metabase", transformation_ctx = "modified_accounts_restrictions_0")
+modified_restriction_metabase_1 = modified_restriction_metabase_0.toDF()
+modified_restriction_metabase_2 = modified_restriction_metabase_1.select("br_restriction_code","tenant_restriction_code","restriction_name")
+
+case_idr_0 = modified_case_master_2.join(modified_accounts_restrictions_2, modified_case_master_2.case_idr == modified_accounts_restrictions_2.case_idr,"inner") 
+print("case joined records",case_idr_0.count())
+tenent_id_0 = case_idr_0.join(modified_restriction_metabase_2, case_idr_0.restriction_tenant_code == modified_restriction_metabase_2.tenant_restriction_code,"inner")
+print("join performed records",tenent_id_0.count())
+tenent_id = tenent_id_0.where(e99_codes)
+print("filter performed records",tenent_id.count())
+modified_0 = modified_res_master_1.join(tenent_id,modified_res_master_1.code ==  tenent_id.br_restriction_code,"inner") 
+
+
+modified_1 = modified_0.withColumn("client_number",lit(client_number_var))\
+.withColumn("spad_security_code",lit("GRNL"))\
+.withColumn("app_type_code",lit("MRGN"))\
+.withColumn("msg_line_number",lit("0000"))\
+.withColumn("creation_date",lit(current_date ()))\
+.withColumn("user_msg_org_code",lit("CARM"))\
+.withColumn("user_security_org_code",lit("MRGN"))\
+.withColumn("expiry_datetype", to_date(col("expiry_date"),"yyyy-MM-dd").cast("string"))\
+.withColumn("updated_timestamp",col("updated_date").cast("string"))
+
+
+modified_2 = modified_1.select("client_number",concat(modified_1.branch_code,modified_1.account_number).alias("branch_account"),"spad_security_code","app_type_code","expiry_datetype","msg_line_number","operation_code","branch_code","account_number","creation_date","user_msg_org_code","user_security_org_code","updated_timestamp","restriction_name")
+modified_3 = modified_2.where("operation_code in('A','D','C')")
+
+print('total_count:',modified_3.count())
+#print(modified_3.distinct().count())
+modified_03 = modified_3.na.drop()
+print('good_records:',modified_03.count())
+modified_03 = modified_03.distinct()
+print('distinct_good_records',modified_03.count())
+
+accounts_rdd = modified_03.rdd.map(transform)
+accounts_rdd.persist(StorageLevel.MEMORY_ONLY)
+record_count = accounts_rdd.count()
+header_rdd = sc.parallelize([get_header_for_naye()])
+trailer_rdd = sc.parallelize([get_trailer_for_naye(str(record_count))])
+if record_count > 0:
+    accounts_rdd = header_rdd.repartition(1).union(accounts_rdd.repartition(1)).union(trailer_rdd.repartition(1))
+else:
+    accounts_rdd = header_rdd.union(trailer_rdd)
+
+check_file_path =  "Spad_out_files/" + output_file_name 
+s3 = boto3.resource('s3')
+bucket = s3.Bucket(outbound_bucket)
+
+def IsObjectExists(path):
+    for object_summary in bucket.objects.filter(Prefix=path):
+        return True
+    return False
+
+if(IsObjectExists(check_file_path)):
+   print("File exists")
+   s3.Object(outbound_bucket , check_file_path).delete()
+else:
+   print("File doesn't exists")
+
+
+dateFormat = "%Y/%m/%d"
+ts=spark.sql(""" select current_date() as ctime """).collect()[0]["ctime"]
+date = ts.strftime(dateFormat)
+resulted_file = "s3://"+ outbound_bucket + "/Daily_files/" + date
+resulted_file_path = "Daily_files/" + date + "/part-00000"
+output_file_path ="Spad_out_files/"+ output_file_name
+print(resulted_file)
+
+accounts_rdd.coalesce(1, shuffle=False).saveAsTextFile(resulted_file)
+
+accounts_rdd.unpersist()
+
+bucket_name = outbound_bucket
+old_prefix = resulted_file_path
+new_prefix = output_file_path
+new_prefix_2 = "Previous_files/" + date + "/" + output_file_name
+s3 = boto3.resource('s3')
+bucket = s3.Bucket(bucket_name)
+
+
+for obj in bucket.objects.filter(Prefix=old_prefix):
+    old_source = { 'Bucket': bucket_name,
+                   'Key': obj.key}
+    # replace the prefix
+    new_key = obj.key.replace(old_prefix, new_prefix, 1)
+    new_obj = bucket.Object(new_key)
+    new_obj.copy(old_source)
+    
+for obj in bucket.objects.filter(Prefix=old_prefix):
+    old_source = { 'Bucket': bucket_name,
+                   'Key': obj.key}
+    # replace the prefix
+    new_key = obj.key.replace(old_prefix, new_prefix_2, 1)
+    new_obj = bucket.Object(new_key)
+    new_obj.copy(old_source)
+    
+print(resulted_file_path)
+s3.Object(outbound_bucket , resulted_file_path).delete()
+
+job.commit()
