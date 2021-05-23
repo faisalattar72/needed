@@ -1,0 +1,211 @@
+import sys
+import requests
+import boto3
+import json
+import datetime
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from configparser import ConfigParser
+
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME','env'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+sc._jsc.hadoopConfiguration().set("mapred.output.committer.class", "org.apache.hadoop.mapred.FileOutputCommitter")
+
+config = ConfigParser()
+file = 'glue_config.ini'
+deploy_env = args['env']
+print(deploy_env)
+config.read(file)
+client_number_var = (config[deploy_env]['client_number'])
+e99_codes_var = (config[deploy_env]['code'])
+e99_codes="tenant_restriction_code in "+ e99_codes_var
+inbound_bucket = (config[deploy_env]['inbound_bucket'])
+input_file_name = (config[deploy_env]['input_file_name'])
+inbound_api_attach  = (config[deploy_env]['inbound_api_attach'])
+inbound_api_detach   = (config[deploy_env]['inbound_api_detach'])
+glue_catalog_db = (config[deploy_env]['glue_catalog_database'])
+
+if deploy_env == "qa" or deploy_env == "uat":
+    token_generator  = (config[deploy_env]['token_generator'])
+    
+
+def mapAddress(line):	
+    return (line[4:7], line[8:13], line[22:32], line[56:57], line[65:75], line[177:250], line[183:250])
+
+address_schema = StructType([StructField("branch_code", StringType(), True),
+                             StructField("account_code", StringType(), True),
+                             StructField("expiry_date", StringType(), True),
+                             StructField("operation_code", StringType(), True),
+                             StructField("effective_date", StringType(), True),
+                             StructField("notes", StringType(), True),
+                             StructField("rest_name", StringType(), True),
+                             ])
+
+
+# READ FROM S3       
+inbound_input_path = "s3://" + inbound_bucket + "/Spad_in_files/" + input_file_name 
+print(inbound_input_path)
+check_file_path =  "Spad_in_files/" + input_file_name
+s3 = boto3.resource('s3')
+bucket = s3.Bucket(inbound_bucket)
+
+def IsObjectExists(path):
+    for object_summary in bucket.objects.filter(Prefix=path):
+        return True
+    return False
+
+if(IsObjectExists(check_file_path)):
+   print("File exists")
+   address_raw_rdd = spark.sparkContext.textFile(inbound_input_path)
+else:
+   print("File doesn't exists")
+
+address_raw_rdd_1 = address_raw_rdd.filter(lambda x: x.startswith(client_number_var))
+address_rdd = address_raw_rdd_1.map(mapAddress)
+address_df = spark.createDataFrame(address_rdd, schema=address_schema)
+address_dff = address_df.repartition(1)
+print(address_dff.take(2))
+
+#CALLING RESTRICTION_MASTER DB CALL
+datasource0 = glueContext.create_dynamic_frame.from_catalog(database = glue_catalog_db, table_name = "ramsdb_public_restriction_metabase", transformation_ctx = "datasource0")
+to_df = datasource0.toDF()
+fields = to_df.select('restriction_name','tenant_restriction_code','br_restriction_code',)
+
+address_dff = address_dff.withColumn("notes", trim(col("notes")))
+tenant_id = fields.join(address_dff,fields.restriction_name == address_dff.notes,"inner")
+result =  tenant_id.where(e99_codes)
+# ATTACH API CALL
+result_attach = result.where(result.operation_code == 'A')
+modified_spad_restriction_2 = result_attach.drop("effectiveDate")\
+                                    .drop("expiry_date").drop("operation_code").drop("notes").drop("rest_name").drop("restriction_idr")
+                                    
+modified_spad_restriction_3 = modified_spad_restriction_2.withColumn("commandID", lit("092020-account-432c-8bdb-f7f5deabdef2"))\
+                                    .withColumn("commandName", lit("processrestrictions"))\
+                                    .withColumn("createDateTime", lit("2020-09-25T18:46:34.381Z"))\
+                                    .withColumn("userID", lit("test"))\
+                                    .withColumn("tenantID", lit("ubs"))\
+                                    .withColumnRenamed("account_code","accountNumber")\
+                                    .withColumnRenamed("branch_code","accountBranch")\
+                                    .withColumnRenamed("br_restriction_code","restrictionCode")\
+                                    .withColumn("effectiveDate", current_date())
+
+
+modified_spad_restriction_4 = modified_spad_restriction_3.withColumn("accounts",array(struct(col("accountBranch"),col("accountNumber"))))\
+                                                        .withColumn("restrictions",array(struct(col("restrictionCode"),col("effectiveDate"))))
+                                                        #.collect_list("accounts").alias("accounts").collect_list("restrictions").alias("restrictions")
+        
+
+modified_spad_restriction_5 = modified_spad_restriction_4.select("commandID","commandName","createDateTime","userID","tenantID","accounts","restrictions")\
+                                                        #.collect_list("accounts").alias("accounts").collect_list("restrictions").alias("restrictions"))
+   
+print('UNIQUE COUNT OF ATTACH RECORDS ',modified_spad_restriction_5.distinct().count())
+modified_spad_restriction_5 = modified_spad_restriction_5.distinct()
+count_of_df = modified_spad_restriction_5.count()
+
+list_of_rows = modified_spad_restriction_5.toJSON().collect()
+
+for i in range(1,count_of_df+1): 
+    if deploy_env == "qa" or deploy_env == "uat":
+        body_for_token ={"commandName": "integrationFetchJwtToken"}
+        token_gen = requests.post(token_generator, json=body_for_token)
+        token_responce = token_gen.text
+        bad_chars =['{','}','"','"','token',':']
+        for i in bad_chars:
+            token_responce = token_responce.replace(i,'')
+        hed = '''{"Authorization" :"Bearer ''' + token_responce +'''"}'''
+        print("header",hed)
+    else:
+        hed = {"Authorization" :"Bearer TESTAPI"}
+    d = list_of_rows[i-1]
+    print(d)
+    #response = requests.post('https://nnnmqfq8dl.execute-api.us-east-1.amazonaws.com/Stage/account/processrestrictions', headers={'Authorization': 'Bearer (TESTAPI)'},data = d)
+    response = requests.post(inbound_api_attach, headers= hed, json = json.loads(d))
+    #response = requests.post('https://command-api.carma.dev.gtocarmaapi.npd.bfsaws.net/wmap/carma/api/v1/account/processrestrictions', headers={'Authorization': 'Bearer TESTAPI'},json = json.loads(d))
+    print('ATTACH API RESPONSE ',response)
+    print(response.text)
+    
+# DETACH API CALL
+#CALLING RESTRICTION_MASTER DB CALL
+datasource1 = glueContext.create_dynamic_frame.from_catalog(database = glue_catalog_db, table_name = "ramsdb_public_restriction_master", transformation_ctx = "datasource1")
+to_df1 = datasource1.toDF()
+fields1 = to_df1.select('restriction_idr','branch_code','universal_account_number','account_number')
+result1 = fields1.join(address_dff,(fields1.account_number == result.account_code)&(fields1.branch_code == result.branch_code),"inner")
+result_detach = result1.where(result1.operation_code == 'D')
+print('count',result_detach.count())
+modified_spad_restriction_11 = result_detach.drop("effectiveDate")\
+                                    .drop("expiry_date").drop("operation_code").drop("notes").drop("code").drop("account_number").drop("account_code").drop("branch_code")
+
+modified_spad_restriction_22 = modified_spad_restriction_11.withColumn("commandName", lit("deleteRestrictions"))\
+                                    .withColumnRenamed("universal_account_number","universalAccountNumber")
+                                    
+modified_spad_restriction_33 = modified_spad_restriction_22.withColumn("restrictionIdentifiers",array(col("restriction_idr")))
+                                                        #.collect_list("accounts").alias("accounts").collect_list("restrictions").alias("restrictions")
+
+modified_spad_restriction_44 = modified_spad_restriction_33.select("commandName","universalAccountNumber","restrictionIdentifiers")
+                                                        #.collect_list("accounts").alias("accounts").collect_list("restrictions").alias("restrictions"))
+                                                        
+print('DETACH UNIQUE REC COUNT ',modified_spad_restriction_44.distinct().count())
+#print('DETACH RECS ',modified_spad_restriction_44.distinct().collect())
+
+modified_spad_restriction_44 = modified_spad_restriction_44.distinct()
+count_of_df = modified_spad_restriction_44.count()
+
+list_of_rows = modified_spad_restriction_44.toJSON().collect()
+
+for i in range(1,count_of_df+1): 
+    if deploy_env == "qa" or deploy_env == "uat":
+        body_for_token ={"commandName": "integrationFetchJwtToken"}
+        token_gen = requests.post(token_generator, json=body_for_token)
+        token_responce = token_gen.text
+        bad_chars =['{','}','"','"','token',':']
+        for i in bad_chars:
+            token_responce = token_responce.replace(i,'')
+        hed = '''{"Authorization" :"Bearer ''' + token_responce +'''"}'''
+        print("header",hed)
+    else:
+        hed = {"Authorization" :"Bearer TESTAPI"}
+    d = list_of_rows[i-1]
+    print(d)
+    #response = requests.post('https://nnnmqfq8dl.execute-api.us-east-1.amazonaws.com/Stage/account/restrictions/remove', headers={'Authorization': 'Bearer (TESTAPI)'},data = d)
+    response = requests.post(inbound_api_detach, headers = hed ,json = json.loads(d))
+    #response = requests.post('https://command-api.carma.dev.gtocarmaapi.npd.bfsaws.net/wmap/carma/api/v1/account/restrictions/remove', headers={'Authorization': 'Bearer TESTAPI'},data = d)
+    print('DETACH API RESPONSE ',response)
+    print(response.text)
+
+dateFormat = "%Y/%m/%d"
+ts = datetime.date.today() 
+today_date = ts.strftime(dateFormat)
+
+bucket_name = inbound_bucket
+old_prefix = "Spad_in_files/"+ input_file_name 
+new_prefix = "Previous_files/"+ today_date + "/" + input_file_name
+s3 = boto3.resource('s3')
+bucket = s3.Bucket(bucket_name)
+
+for obj in bucket.objects.filter(Prefix=old_prefix):
+    old_source = { 'Bucket': bucket_name,
+                   'Key': obj.key}
+    # replace the prefix
+    new_key = obj.key.replace(old_prefix, new_prefix, 1)
+    new_obj = bucket.Object(new_key)
+    new_obj.copy(old_source)
+    
+key_path = "Spad_in_files/" + input_file_name 
+print(key_path)
+s3 = boto3.resource('s3')
+s3.Object(inbound_bucket , key_path ).delete()
+    
+job.commit()
